@@ -1,0 +1,14 @@
+[Unit]
+Description=CLIProxyAPI weekly-reset priority controller
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/cliproxy-priority-controller/env
+ExecStart=%h/.local/bin/cliproxy-priority-controller
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=default.target
