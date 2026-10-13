@@ -42,7 +42,7 @@ type Config struct {
 func Load(args []string) (Config, error) {
 	cfg := Config{
 		URL:                    envString("CLIPROXY_URL", defaultURL),
-		ManagementKey:          firstNonEmpty(os.Getenv("CLIPROXY_MANAGEMENT_KEY"), os.Getenv("MANAGEMEENT_KEY")),
+		ManagementKey:          firstNonEmpty(os.Getenv("CLIPROXY_MANAGEMENT_KEY"), os.Getenv("MANAGEMENT_KEY")),
 		APIVersion:             strings.ToLower(envString("CLIPROXY_API_VERSION", defaultAPIVersion)),
 		Interval:               envDuration("CLIPROXY_INTERVAL", defaultInterval),
 		HTTPTimeout:            envDuration("CLIPROXY_HTTP_TIMEOUT", defaultHTTPTimeout),
@@ -92,7 +92,7 @@ func Load(args []string) (Config, error) {
 	}
 	for provider := range cfg.Providers {
 		if provider != "claude" && provider != "codex" {
-			return Config{}, fmt.Errorf(unsupported provider %q", provider)
+			return Config{}, fmt.Errorf("unsupported provider %q", provider)
 		}
 	}
 	if cfg.Interval <= 0 {
