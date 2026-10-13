@@ -12,12 +12,19 @@ import (
 	"github.com/lucas-varjao/cliproxy-priority-controller/internal/quota"
 )
 
+const (
+	FiveHourModeOff       = "off"
+	FiveHourModeGuardrail = "guardrail"
+)
+
 type Config struct {
-	Providers    map[string]bool
-	PriorityMax  int
-	PriorityStep int
-	DryRun       bool
-	UserAgent    string
+	Providers              map[string]bool
+	PriorityMax            int
+	PriorityStep           int
+	DryRun                 bool
+	UserAgent              string
+	FiveHourMode           string
+	FiveHourMaxUtilization float64
 }
 
 type Controller struct {
@@ -35,8 +42,8 @@ type observation struct {
 type Change struct {
 	Provider    string
 	Credential  cliproxy.Credential
-	ResetAt     time.Time
-	Utilization float64
+	Quota       quota.Result
+	Decision    string
 	OldPriority int
 	NewPriority int
 }
@@ -80,14 +87,7 @@ func (c *Controller) Reconcile(ctx context.Context) error {
 			continue
 		}
 		for _, change := range changes {
-			attrs := []any{
-				"provider", change.Provider,
-				"credential", change.Credential.TargetName(),
-				"reset_at", change.ResetAt.Format(time.RFC3339),
-				"utilization", change.Utilization,
-				"old_priority", change.OldPriority,
-				"new_priority", change.NewPriority,
-			}
+			attrs := changeLogAttrs(change)
 			if c.config.DryRun {
 				c.logger.Info("would update priority", attrs...)
 				continue
@@ -113,31 +113,27 @@ func (c *Controller) planProvider(ctx context.Context, provider string, credenti
 		observations = append(observations, observation{Credential: credential, Quota: result})
 	}
 
-	sort.SliceStable(observations, func(i, j int) bool {
-		if observations[i].Quota.ResetAt.Equal(observations[j].Quota.ResetAt) {
-			return observations[i].Credential.TargetName() < observations[j].Credential.TargetName()
-		}
-		return observations[i].Quota.ResetAt.Before(observations[j].Quota.ResetAt)
-	})
+	sortObservations(observations, c.config.FiveHourMode, c.config.FiveHourMaxUtilization)
+	priorities := AssignPriorities(observations, c.config.PriorityMax, c.config.PriorityStep, c.config.FiveHourMode, c.config.FiveHourMaxUtilization)
 
-	priorities := AssignPriorities(observations, c.config.PriorityMax, c.config.PriorityStep)
 	changes := make([]Change, 0, len(observations))
 	for i, item := range observations {
 		newPriority := priorities[i]
+		decision := decisionFor(item, c.config.FiveHourMode, c.config.FiveHourMaxUtilization)
 		if item.Credential.Priority == newPriority {
-			c.logger.Debug("priority already correct",
-				"provider", provider,
-				"credential", item.Credential.TargetName(),
-				"priority", newPriority,
-				"reset_at", item.Quota.ResetAt.Format(time.RFC3339),
-			)
+			attrs := observationLogAttrs(provider, item, decision, item.Credential.Priority, newPriority)
+			if c.config.DryRun {
+				c.logger.Info("priority already correct", attrs...)
+			} else {
+				c.logger.Debug("priority already correct", attrs...)
+			}
 			continue
 		}
 		changes = append(changes, Change{
 			Provider:    provider,
 			Credential:  item.Credential,
-			ResetAt:     item.Quota.ResetAt,
-			Utilization: item.Quota.Utilization,
+			Quota:       item.Quota,
+			Decision:    decision,
 			OldPriority: item.Credential.Priority,
 			NewPriority: newPriority,
 		})
@@ -161,7 +157,21 @@ func (c *Controller) fetchQuotaWithRefresh(ctx context.Context, credential clipr
 	return quota.Fetch(ctx, c.client, credential, c.config.UserAgent, c.now().UTC())
 }
 
-func AssignPriorities(items []observation, maxPriority, step int) []int {
+func sortObservations(items []observation, fiveHourMode string, maxUtilization float64) {
+	sort.SliceStable(items, func(i, j int) bool {
+		leftConstrained := isFiveHourConstrained(items[i], fiveHourMode, maxUtilization)
+		rightConstrained := isFiveHourConstrained(items[j], fiveHourMode, maxUtilization)
+		if leftConstrained != rightConstrained {
+			return !leftConstrained
+		}
+		if items[i].Quota.Weekly.ResetAt.Equal(items[j].Quota.Weekly.ResetAt) {
+			return items[i].Credential.TargetName() < items[j].Credential.TargetName()
+		}
+		return items[i].Quota.Weekly.ResetAt.Before(items[j].Quota.Weekly.ResetAt)
+	})
+}
+
+func AssignPriorities(items []observation, maxPriority, step int, fiveHourMode string, maxUtilization float64) []int {
 	priorities := make([]int, len(items))
 	if len(items) == 0 {
 		return priorities
@@ -170,12 +180,61 @@ func AssignPriorities(items []observation, maxPriority, step int) []int {
 	priority := maxPriority
 	priorities[0] = priority
 	for i := 1; i < len(items); i++ {
-		if !items[i].Quota.ResetAt.Equal(items[i-1].Quota.ResetAt) {
+		if !samePriorityTier(items[i-1], items[i], fiveHourMode, maxUtilization) {
 			priority -= step
 		}
 		priorities[i] = priority
 	}
 	return priorities
+}
+
+func samePriorityTier(left, right observation, fiveHourMode string, maxUtilization float64) bool {
+	if isFiveHourConstrained(left, fiveHourMode, maxUtilization) != isFiveHourConstrained(right, fiveHourMode, maxUtilization) {
+		return false
+	}
+	return left.Quota.Weekly.ResetAt.Equal(right.Quota.Weekly.ResetAt)
+}
+
+func isFiveHourConstrained(item observation, fiveHourMode string, maxUtilization float64) bool {
+	if fiveHourMode != FiveHourModeGuardrail || item.Quota.FiveHour == nil {
+		return false
+	}
+	return item.Quota.FiveHour.Utilization >= maxUtilization
+}
+
+func decisionFor(item observation, fiveHourMode string, maxUtilization float64) string {
+	if isFiveHourConstrained(item, fiveHourMode, maxUtilization) {
+		return "five-hour-guardrail"
+	}
+	return "weekly-reset"
+}
+
+func changeLogAttrs(change Change) []any {
+	return observationLogAttrs(change.Provider, observation{Credential: change.Credential, Quota: change.Quota}, change.Decision, change.OldPriority, change.NewPriority)
+}
+
+func observationLogAttrs(provider string, item observation, decision string, oldPriority, newPriority int) []any {
+	attrs := []any{
+		"provider", provider,
+		"credential", item.Credential.TargetName(),
+		"decision", decision,
+		"weekly_reset_at", item.Quota.Weekly.ResetAt.Format(time.RFC3339),
+		"weekly_utilization", item.Quota.Weekly.Utilization,
+		"weekly_source", item.Quota.Weekly.Source,
+	}
+	if item.Quota.FiveHour != nil {
+		attrs = append(attrs,
+			"five_hour_reset_at", item.Quota.FiveHour.ResetAt.Format(time.RFC3339),
+			"five_hour_utilization", item.Quota.FiveHour.Utilization,
+			"five_hour_source", item.Quota.FiveHour.Source,
+		)
+	} else {
+		attrs = append(attrs, "five_hour_available", false)
+	}
+	return append(attrs,
+		"old_priority", oldPriority,
+		"new_priority", newPriority,
+	)
 }
 
 func errorsJoin(left, right error) error {

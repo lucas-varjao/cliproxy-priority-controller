@@ -11,39 +11,45 @@ import (
 )
 
 const (
-	defaultURL          = "http://127.0.0.1:8317"
-	defaultAPIVersion   = "auto"
-	defaultProviders    = "claude,codex"
-	defaultInterval     = 5 * time.Minute
-	defaultHTTPTimeout  = 30 * time.Second
-	defaultPriorityMax  = 100
-	defaultPriorityStep = 1
+	defaultURL                    = "http://127.0.0.1:8317"
+	defaultAPIVersion             = "auto"
+	defaultProviders              = "claude,codex"
+	defaultInterval               = 5 * time.Minute
+	defaultHTTPTimeout            = 30 * time.Second
+	defaultPriorityMax            = 100
+	defaultPriorityStep           = 1
+	defaultFiveHourMode           = "off"
+	defaultFiveHourMaxUtilization = 90.0
 )
 
 type Config struct {
-	URL           string
-	ManagementKey string
-	APIVersion    string
-	Providers     map[string]bool
-	Interval      time.Duration
-	HTTPTimeout   time.Duration
-	PriorityMax   int
-	PriorityStep  int
-	DryRun        bool
-	Once          bool
+	URL                    string
+	ManagementKey          string
+	APIVersion             string
+	Providers              map[string]bool
+	Interval               time.Duration
+	HTTPTimeout            time.Duration
+	PriorityMax            int
+	PriorityStep           int
+	FiveHourMode           string
+	FiveHourMaxUtilization float64
+	DryRun                 bool
+	Once                   bool
 }
 
 func Load(args []string) (Config, error) {
 	cfg := Config{
-		URL:           envString("CLIPROXY_URL", defaultURL),
-		ManagementKey: firstNonEmpty(os.Getenv("CLIPROXY_MANAGEMENT_KEY"), os.Getenv("MANAGEMENT_KEY")),
-		APIVersion:    strings.ToLower(envString("CLIPROXY_API_VERSION", defaultAPIVersion)),
-		Interval:      envDuration("CLIPROXY_INTERVAL", defaultInterval),
-		HTTPTimeout:   envDuration("CLIPROXY_HTTP_TIMEOUT", defaultHTTPTimeout),
-		PriorityMax:   envInt("CLIPROXY_PRIORITY_MAX", defaultPriorityMax),
-		PriorityStep:  envInt("CLIPROXY_PRIORITY_STEP", defaultPriorityStep),
-		DryRun:        envBool("CLIPROXY_DRY_RUN", false),
-		Once:          envBool("CLIPROXY_ONCE", false),
+		URL:                    envString("CLIPROXY_URL", defaultURL),
+		ManagementKey:          firstNonEmpty(os.Getenv("CLIPROXY_MANAGEMENT_KEY"), os.Getenv("MANAGEMENT_KEY")),
+		APIVersion:             strings.ToLower(envString("CLIPROXY_API_VERSION", defaultAPIVersion)),
+		Interval:               envDuration("CLIPROXY_INTERVAL", defaultInterval),
+		HTTPTimeout:            envDuration("CLIPROXY_HTTP_TIMEOUT", defaultHTTPTimeout),
+		PriorityMax:            envInt("CLIPROXY_PRIORITY_MAX", defaultPriorityMax),
+		PriorityStep:           envInt("CLIPROXY_PRIORITY_STEP", defaultPriorityStep),
+		FiveHourMode:           strings.ToLower(envString("CLIPROXY_FIVE_HOUR_MODE", defaultFiveHourMode)),
+		FiveHourMaxUtilization: envFloat("CLIPROXY_FIVE_HOUR_MAX_UTILIZATION", defaultFiveHourMaxUtilization),
+		DryRun:                 envBool("CLIPROXY_DRY_RUN", false),
+		Once:                   envBool("CLIPROXY_ONCE", false),
 	}
 
 	providersRaw := envString("CLIPROXY_PROVIDERS", defaultProviders)
@@ -54,9 +60,11 @@ func Load(args []string) (Config, error) {
 	fs.StringVar(&providersRaw, "providers", providersRaw, "comma-separated providers to manage")
 	fs.DurationVar(&cfg.Interval, "interval", cfg.Interval, "reconciliation interval")
 	fs.DurationVar(&cfg.HTTPTimeout, "http-timeout", cfg.HTTPTimeout, "per-request HTTP timeout")
-	fs.IntVar(&cfg.PriorityMax, "priority-max", cfg.PriorityMax, "priority assigned to the soonest weekly reset")
-	fs.IntVar(&cfg.PriorityStep, "priority-step", cfg.PriorityStep, "priority decrement per rank")
-	fs.BoolVar(&cfg.DryRun, "dry-run", cfg.DryRun, "show changes without applying them")
+	fs.IntVar(&cfg.PriorityMax, "priority-max", cfg.PriorityMax, "priority assigned to the highest-ranked credential")
+	fs.IntVar(&cfg.PriorityStep, "priority-step", cfg.PriorityStep, "priority decrement per rank tier")
+	fs.StringVar(&cfg.FiveHourMode, "five-hour-mode", cfg.FiveHourMode, "5-hour policy: off or guardrail")
+	fs.Float64Var(&cfg.FiveHourMaxUtilization, "five-hour-max-utilization", cfg.FiveHourMaxUtilization, "guardrail threshold as percent used")
+	fs.BoolVar(&cfg.DryRun, "dry-run", cfg.DryRun, "show decisions without applying changes")
 	fs.BoolVar(&cfg.Once, "once", cfg.Once, "run one reconciliation and exit")
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
@@ -64,6 +72,7 @@ func Load(args []string) (Config, error) {
 
 	cfg.URL = strings.TrimRight(strings.TrimSpace(cfg.URL), "/")
 	cfg.APIVersion = strings.ToLower(strings.TrimSpace(cfg.APIVersion))
+	cfg.FiveHourMode = strings.ToLower(strings.TrimSpace(cfg.FiveHourMode))
 	cfg.Providers = parseProviders(providersRaw)
 
 	if cfg.URL == "" {
@@ -90,6 +99,14 @@ func Load(args []string) (Config, error) {
 	}
 	if cfg.PriorityStep <= 0 {
 		return Config{}, errors.New("priority-step must be greater than zero")
+	}
+	switch cfg.FiveHourMode {
+	case "off", "guardrail":
+	default:
+		return Config{}, fmt.Errorf("invalid five-hour-mode %q: expected off or guardrail", cfg.FiveHourMode)
+	}
+	if cfg.FiveHourMaxUtilization <= 0 || cfg.FiveHourMaxUtilization > 100 {
+		return Config{}, errors.New("five-hour-max-utilization must be greater than 0 and at most 100")
 	}
 	return cfg, nil
 }
@@ -119,6 +136,18 @@ func envInt(name string, fallback int) int {
 		return fallback
 	}
 	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return fallback
+	}
+	return parsed
+}
+
+func envFloat(name string, fallback float64) float64 {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseFloat(value, 64)
 	if err != nil {
 		return fallback
 	}

@@ -13,10 +13,15 @@ import (
 	"github.com/lucas-varjao/cliproxy-priority-controller/internal/cliproxy"
 )
 
-type Result struct {
+type Window struct {
 	ResetAt     time.Time
 	Utilization float64
 	Source      string
+}
+
+type Result struct {
+	FiveHour *Window
+	Weekly   Window
 }
 
 type UpstreamError struct {
@@ -67,48 +72,94 @@ func fetchClaude(ctx context.Context, client *cliproxy.Client, credential clipro
 	return parseClaude([]byte(response.Body))
 }
 
+type claudeBucket struct {
+	Utilization float64 `json:"utilization"`
+	ResetsAt    string  `json:"resets_at"`
+}
+
+type claudeLimit struct {
+	Kind     string  `json:"kind"`
+	Group    string  `json:"group"`
+	Percent  float64 `json:"percent"`
+	ResetsAt string  `json:"resets_at"`
+	IsActive bool    `json:"is_active"`
+	Scope    struct {
+		Model any `json:"model"`
+	} `json:"scope"`
+}
+
 func parseClaude(data []byte) (Result, error) {
 	var payload struct {
-		SevenDay *struct {
-			Utilization float64 `json:"utilization"`
-			ResetsAt    string  `json:"resets_at"`
-		} `json:"seven_day"`
-		Limits []struct {
-			Kind     string  `json:"kind"`
-			Group    string  `json:"group"`
-			Percent  float64 `json:"percent"`
-			ResetsAt string  `json:"resets_at"`
-			IsActive bool    `json:"is_active"`
-			Scope    struct {
-				Model any `json:"model"`
-			} `json:"scope"`
-		} `json:"limits"`
+		FiveHour *claudeBucket `json:"five_hour"`
+		SevenDay *claudeBucket `json:"seven_day"`
+		Limits   []claudeLimit `json:"limits"`
 	}
 	if err := json.Unmarshal(data, &payload); err != nil {
 		return Result{}, fmt.Errorf("parse Claude quota response: %w", err)
 	}
-	if payload.SevenDay != nil && strings.TrimSpace(payload.SevenDay.ResetsAt) != "" {
-		reset, err := parseTime(payload.SevenDay.ResetsAt)
-		if err != nil {
-			return Result{}, fmt.Errorf("parse Claude seven_day reset: %w", err)
-		}
-		return Result{ResetAt: reset, Utilization: payload.SevenDay.Utilization, Source: "seven_day"}, nil
+
+	fiveHour, err := claudeBucketWindow(payload.FiveHour, "five_hour")
+	if err != nil {
+		return Result{}, fmt.Errorf("parse Claude five_hour reset: %w", err)
 	}
-	for _, limit := range payload.Limits {
-		kind := strings.ToLower(strings.TrimSpace(limit.Kind))
-		if kind != "weekly_all" && kind != "weekly" && !strings.Contains(kind, "weekly") {
-			continue
-		}
-		if strings.TrimSpace(limit.ResetsAt) == "" {
-			continue
-		}
-		reset, err := parseTime(limit.ResetsAt)
-		if err != nil {
-			continue
-		}
-		return Result{ResetAt: reset, Utilization: limit.Percent, Source: "limits:" + kind}, nil
+	if fiveHour == nil {
+		fiveHour = findClaudeLimitWindow(payload.Limits, false)
 	}
-	return Result{}, errors.New("Claude response did not contain a weekly reset")
+
+	weekly, err := claudeBucketWindow(payload.SevenDay, "seven_day")
+	if err != nil {
+		return Result{}, fmt.Errorf("parse Claude seven_day reset: %w", err)
+	}
+	if weekly == nil {
+		weekly = findClaudeLimitWindow(payload.Limits, true)
+	}
+	if weekly == nil {
+		return Result{}, errors.New("Claude response did not contain a weekly reset")
+	}
+
+	return Result{FiveHour: fiveHour, Weekly: *weekly}, nil
+}
+
+func claudeBucketWindow(bucket *claudeBucket, source string) (*Window, error) {
+	if bucket == nil || strings.TrimSpace(bucket.ResetsAt) == "" {
+		return nil, nil
+	}
+	reset, err := parseTime(bucket.ResetsAt)
+	if err != nil {
+		return nil, err
+	}
+	return &Window{ResetAt: reset, Utilization: bucket.Utilization, Source: source}, nil
+}
+
+func findClaudeLimitWindow(limits []claudeLimit, weekly bool) *Window {
+	matches := func(kind string, exactOnly bool) bool {
+		kind = strings.ToLower(strings.TrimSpace(kind))
+		if weekly {
+			if kind == "weekly_all" || kind == "weekly" {
+				return true
+			}
+			return !exactOnly && strings.Contains(kind, "weekly")
+		}
+		if kind == "session" || kind == "five_hour" || kind == "five-hour" {
+			return true
+		}
+		return !exactOnly && (strings.Contains(kind, "session") || strings.Contains(kind, "five"))
+	}
+
+	for _, exactOnly := range []bool{true, false} {
+		for _, limit := range limits {
+			if !matches(limit.Kind, exactOnly) || strings.TrimSpace(limit.ResetsAt) == "" {
+				continue
+			}
+			reset, err := parseTime(limit.ResetsAt)
+			if err != nil {
+				continue
+			}
+			kind := strings.ToLower(strings.TrimSpace(limit.Kind))
+			return &Window{ResetAt: reset, Utilization: limit.Percent, Source: "limits:" + kind}
+		}
+	}
+	return nil
 }
 
 func fetchCodex(ctx context.Context, client *cliproxy.Client, credential cliproxy.Credential, userAgent string, now time.Time) (Result, error) {
@@ -166,23 +217,68 @@ func parseCodex(data []byte, now time.Time) (Result, error) {
 		}
 	}
 
-	for _, window := range candidates {
-		if window.WindowSeconds >= 6*24*60*60 && window.WindowSeconds < 28*24*60*60 {
-			return Result{ResetAt: window.ResetAt, Utilization: window.UsedPercent, Source: "rate_limit:" + window.Name}, nil
-		}
+	weekly := selectCodexWeekly(candidates)
+	if weekly == nil {
+		return Result{}, errors.New("Codex response did not contain a weekly reset window")
 	}
-	for _, window := range candidates {
-		if window.Name == "secondary_window" {
-			return Result{ResetAt: window.ResetAt, Utilization: window.UsedPercent, Source: "rate_limit:secondary_window"}, nil
-		}
-	}
-	for _, window := range candidates {
-		if window.WindowSeconds == 0 && window.Name == "primary_window" {
-			return Result{ResetAt: window.ResetAt, Utilization: window.UsedPercent, Source: "rate_limit:primary_window-legacy"}, nil
-		}
-	}
+	fiveHour := selectCodexFiveHour(candidates)
 
-	return Result{}, errors.New("Codex response did not contain a weekly reset window")
+	result := Result{Weekly: codexResultWindow(*weekly)}
+	if fiveHour != nil {
+		window := codexResultWindow(*fiveHour)
+		result.FiveHour = &window
+	}
+	return result, nil
+}
+
+func selectCodexWeekly(candidates []codexWindow) *codexWindow {
+	for i := range candidates {
+		window := &candidates[i]
+		if window.WindowSeconds >= 6*24*60*60 && window.WindowSeconds < 28*24*60*60 {
+			return window
+		}
+	}
+	for i := range candidates {
+		window := &candidates[i]
+		if window.Name == "secondary_window" && window.WindowSeconds == 0 {
+			return window
+		}
+	}
+	if len(candidates) == 1 && candidates[0].Name == "primary_window" && candidates[0].WindowSeconds == 0 {
+		return &candidates[0]
+	}
+	return nil
+}
+
+func selectCodexFiveHour(candidates []codexWindow) *codexWindow {
+	const (
+		minSessionWindow = 4 * time.Hour
+		maxSessionWindow = 6 * time.Hour
+	)
+	for i := range candidates {
+		window := &candidates[i]
+		duration := time.Duration(window.WindowSeconds) * time.Second
+		if duration >= minSessionWindow && duration <= maxSessionWindow {
+			return window
+		}
+	}
+	if len(candidates) >= 2 {
+		for i := range candidates {
+			window := &candidates[i]
+			if window.Name == "primary_window" && window.WindowSeconds == 0 {
+				return window
+			}
+		}
+	}
+	return nil
+}
+
+func codexResultWindow(window codexWindow) Window {
+	return Window{
+		ResetAt:     window.ResetAt,
+		Utilization: window.UsedPercent,
+		Source:      "rate_limit:" + window.Name,
+	}
 }
 
 func parseCodexWindow(raw map[string]any, name string, now time.Time) (codexWindow, bool) {

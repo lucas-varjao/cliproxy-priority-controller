@@ -33,11 +33,13 @@ func run() error {
 	userAgent := "cliproxy-priority-controller/" + version
 	client := cliproxy.New(cfg.URL, cfg.ManagementKey, cfg.APIVersion, userAgent, cfg.HTTPTimeout)
 	ctrl := controller.New(client, controller.Config{
-		Providers:    cfg.Providers,
-		PriorityMax:  cfg.PriorityMax,
-		PriorityStep: cfg.PriorityStep,
-		DryRun:       cfg.DryRun,
-		UserAgent:    userAgent,
+		Providers:              cfg.Providers,
+		PriorityMax:            cfg.PriorityMax,
+		PriorityStep:           cfg.PriorityStep,
+		DryRun:                 cfg.DryRun,
+		UserAgent:              userAgent,
+		FiveHourMode:           cfg.FiveHourMode,
+		FiveHourMaxUtilization: cfg.FiveHourMaxUtilization,
 	}, logger)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -53,6 +55,8 @@ func run() error {
 		"dry_run", cfg.DryRun,
 		"once", cfg.Once,
 		"interval", cfg.Interval,
+		"five_hour_mode", cfg.FiveHourMode,
+		"five_hour_max_utilization", cfg.FiveHourMaxUtilization,
 	)
 
 	if err := ctrl.Reconcile(ctx); err != nil {
