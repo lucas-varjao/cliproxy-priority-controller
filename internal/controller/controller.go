@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -15,6 +16,15 @@ import (
 const (
 	FiveHourModeOff       = "off"
 	FiveHourModeGuardrail = "guardrail"
+
+	quotaPollLowUtilization  = 30 * time.Minute
+	quotaPollMidUtilization  = 15 * time.Minute
+	quotaPollHighUtilization = 10 * time.Minute
+	quotaPollAfterStaleReset = 5 * time.Minute
+	quotaResetGrace          = 30 * time.Second
+
+	rateLimitBackoffMin = 15 * time.Minute
+	rateLimitBackoffMax = 2 * time.Hour
 )
 
 type Config struct {
@@ -25,6 +35,7 @@ type Config struct {
 	UserAgent              string
 	FiveHourMode           string
 	FiveHourMaxUtilization float64
+	QuotaRequestSpacing    time.Duration
 }
 
 type Controller struct {
@@ -32,24 +43,53 @@ type Controller struct {
 	config Config
 	logger *slog.Logger
 	now    func() time.Time
+
+	quotaCache       map[string]quotaCacheEntry
+	lastQuotaRequest time.Time
+}
+
+type quotaCacheEntry struct {
+	Result      quota.Result
+	HasResult   bool
+	NextCheck   time.Time
+	RateLimited bool
+	Backoff     time.Duration
 }
 
 type observation struct {
 	Credential cliproxy.Credential
 	Quota      quota.Result
+	Cached     bool
+	NextCheck  time.Time
 }
 
 type Change struct {
 	Provider    string
 	Credential  cliproxy.Credential
 	Quota       quota.Result
+	Cached      bool
+	NextCheck   time.Time
 	Decision    string
 	OldPriority int
 	NewPriority int
 }
 
+type providerBackoffError struct {
+	Until time.Time
+}
+
+func (e *providerBackoffError) Error() string {
+	return "quota rate-limit backoff active until " + e.Until.Format(time.RFC3339)
+}
+
 func New(client *cliproxy.Client, cfg Config, logger *slog.Logger) *Controller {
-	return &Controller{client: client, config: cfg, logger: logger, now: time.Now}
+	return &Controller{
+		client:     client,
+		config:     cfg,
+		logger:     logger,
+		now:        time.Now,
+		quotaCache: make(map[string]quotaCacheEntry),
+	}
 }
 
 func (c *Controller) Reconcile(ctx context.Context) error {
@@ -59,6 +99,7 @@ func (c *Controller) Reconcile(ctx context.Context) error {
 	}
 
 	byProvider := make(map[string][]cliproxy.Credential)
+	activeCacheKeys := make(map[string]struct{})
 	for _, credential := range credentials {
 		provider := credential.ProviderName()
 		if !c.config.Providers[provider] || credential.Disabled {
@@ -73,7 +114,9 @@ func (c *Controller) Reconcile(ctx context.Context) error {
 			continue
 		}
 		byProvider[provider] = append(byProvider[provider], credential)
+		activeCacheKeys[credentialCacheKey(credential)] = struct{}{}
 	}
+	c.pruneQuotaCache(activeCacheKeys)
 
 	var reconcileErr error
 	for provider, providerCredentials := range byProvider {
@@ -82,8 +125,16 @@ func (c *Controller) Reconcile(ctx context.Context) error {
 		}
 		changes, err := c.planProvider(ctx, provider, providerCredentials)
 		if err != nil {
-			c.logger.Error("provider reconciliation skipped", "provider", provider, "error", err)
-			reconcileErr = errorsJoin(reconcileErr, err)
+			var backoffErr *providerBackoffError
+			switch {
+			case errors.As(err, &backoffErr):
+				c.logger.Debug("provider quota polling paused", "provider", provider, "retry_at", backoffErr.Until.Format(time.RFC3339))
+			case quota.IsRateLimited(err):
+				c.logger.Warn("provider quota polling rate limited; priorities left unchanged", "provider", provider, "error", err)
+			default:
+				c.logger.Error("provider reconciliation skipped", "provider", provider, "error", err)
+				reconcileErr = errorsJoin(reconcileErr, err)
+			}
 			continue
 		}
 		for _, change := range changes {
@@ -104,13 +155,22 @@ func (c *Controller) Reconcile(ctx context.Context) error {
 }
 
 func (c *Controller) planProvider(ctx context.Context, provider string, credentials []cliproxy.Credential) ([]Change, error) {
+	if until := c.providerBackoffUntil(credentials); !until.IsZero() {
+		return nil, &providerBackoffError{Until: until}
+	}
+
 	observations := make([]observation, 0, len(credentials))
 	for _, credential := range credentials {
-		result, err := c.fetchQuotaWithRefresh(ctx, credential)
+		result, cached, nextCheck, err := c.quotaForCredential(ctx, credential)
 		if err != nil {
 			return nil, fmt.Errorf("%s quota for %s: %w", provider, credential.TargetName(), err)
 		}
-		observations = append(observations, observation{Credential: credential, Quota: result})
+		observations = append(observations, observation{
+			Credential: credential,
+			Quota:      result,
+			Cached:     cached,
+			NextCheck:  nextCheck,
+		})
 	}
 
 	sortObservations(observations, c.config.FiveHourMode, c.config.FiveHourMaxUtilization)
@@ -133,6 +193,8 @@ func (c *Controller) planProvider(ctx context.Context, provider string, credenti
 			Provider:    provider,
 			Credential:  item.Credential,
 			Quota:       item.Quota,
+			Cached:      item.Cached,
+			NextCheck:   item.NextCheck,
 			Decision:    decision,
 			OldPriority: item.Credential.Priority,
 			NewPriority: newPriority,
@@ -141,8 +203,52 @@ func (c *Controller) planProvider(ctx context.Context, provider string, credenti
 	return changes, nil
 }
 
+func (c *Controller) quotaForCredential(ctx context.Context, credential cliproxy.Credential) (quota.Result, bool, time.Time, error) {
+	now := c.now().UTC()
+	key := credentialCacheKey(credential)
+	entry, exists := c.quotaCache[key]
+	if exists && now.Before(entry.NextCheck) {
+		if entry.RateLimited {
+			return quota.Result{}, false, entry.NextCheck, &providerBackoffError{Until: entry.NextCheck}
+		}
+		if entry.HasResult {
+			return entry.Result, true, entry.NextCheck, nil
+		}
+	}
+
+	result, err := c.fetchQuotaWithRefresh(ctx, credential)
+	if err != nil {
+		if quota.IsRateLimited(err) {
+			backoff := nextRateLimitBackoff(entry.Backoff)
+			wait := backoff
+			if retryAfter := quota.RateLimitRetryAfter(err); retryAfter > wait {
+				wait = retryAfter
+			}
+			entry.RateLimited = true
+			entry.Backoff = backoff
+			entry.NextCheck = now.Add(wait)
+			c.quotaCache[key] = entry
+			c.logger.Warn("quota endpoint rate limited; backing off",
+				"provider", credential.ProviderName(),
+				"credential", credential.TargetName(),
+				"retry_at", entry.NextCheck.Format(time.RFC3339),
+				"backoff", wait,
+			)
+		}
+		return quota.Result{}, false, time.Time{}, err
+	}
+
+	nextCheck := nextQuotaCheck(now, result, c.config.FiveHourMode, c.config.FiveHourMaxUtilization)
+	c.quotaCache[key] = quotaCacheEntry{
+		Result:    result,
+		HasResult: true,
+		NextCheck: nextCheck,
+	}
+	return result, false, nextCheck, nil
+}
+
 func (c *Controller) fetchQuotaWithRefresh(ctx context.Context, credential cliproxy.Credential) (quota.Result, error) {
-	result, err := quota.Fetch(ctx, c.client, credential, c.config.UserAgent, c.now().UTC())
+	result, err := c.fetchQuota(ctx, credential)
 	if err == nil || !quota.IsUnauthorized(err) {
 		return result, err
 	}
@@ -154,7 +260,113 @@ func (c *Controller) fetchQuotaWithRefresh(ctx context.Context, credential clipr
 	if refreshErr := c.client.RefreshCredential(ctx, credential); refreshErr != nil {
 		return quota.Result{}, fmt.Errorf("refresh credential after quota 401: %w", refreshErr)
 	}
+	return c.fetchQuota(ctx, credential)
+}
+
+func (c *Controller) fetchQuota(ctx context.Context, credential cliproxy.Credential) (quota.Result, error) {
+	if err := c.waitForQuotaRequestSpacing(ctx); err != nil {
+		return quota.Result{}, err
+	}
+	c.lastQuotaRequest = time.Now()
 	return quota.Fetch(ctx, c.client, credential, c.config.UserAgent, c.now().UTC())
+}
+
+func (c *Controller) waitForQuotaRequestSpacing(ctx context.Context) error {
+	if c.config.QuotaRequestSpacing <= 0 || c.lastQuotaRequest.IsZero() {
+		return nil
+	}
+	wait := c.config.QuotaRequestSpacing - time.Since(c.lastQuotaRequest)
+	if wait <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func (c *Controller) providerBackoffUntil(credentials []cliproxy.Credential) time.Time {
+	now := c.now().UTC()
+	var latest time.Time
+	for _, credential := range credentials {
+		entry, ok := c.quotaCache[credentialCacheKey(credential)]
+		if !ok || !entry.RateLimited || !now.Before(entry.NextCheck) {
+			continue
+		}
+		if entry.NextCheck.After(latest) {
+			latest = entry.NextCheck
+		}
+	}
+	return latest
+}
+
+func (c *Controller) pruneQuotaCache(active map[string]struct{}) {
+	for key := range c.quotaCache {
+		if _, ok := active[key]; !ok {
+			delete(c.quotaCache, key)
+		}
+	}
+}
+
+func credentialCacheKey(credential cliproxy.Credential) string {
+	identity := strings.TrimSpace(credential.AuthIndex)
+	if identity == "" {
+		identity = strings.TrimSpace(credential.ID)
+	}
+	if identity == "" {
+		identity = credential.TargetName()
+	}
+	return credential.ProviderName() + "\x00" + identity
+}
+
+func nextQuotaCheck(now time.Time, result quota.Result, fiveHourMode string, maxUtilization float64) time.Time {
+	interval := quotaPollLowUtilization
+	if fiveHourMode == FiveHourModeGuardrail && result.FiveHour != nil {
+		utilization := result.FiveHour.Utilization
+		midThreshold := max(0, maxUtilization-20)
+		highThreshold := max(0, maxUtilization-5)
+		switch {
+		case utilization >= maxUtilization:
+			if result.FiveHour.ResetAt.After(now) {
+				next := result.FiveHour.ResetAt.Add(quotaResetGrace)
+				return earlierResetCheck(now, next, result.Weekly.ResetAt)
+			}
+			interval = quotaPollAfterStaleReset
+		case utilization >= highThreshold:
+			interval = quotaPollHighUtilization
+		case utilization >= midThreshold:
+			interval = quotaPollMidUtilization
+		}
+	}
+
+	next := now.Add(interval)
+	return earlierResetCheck(now, next, result.Weekly.ResetAt)
+}
+
+func earlierResetCheck(now, current, resetAt time.Time) time.Time {
+	if !resetAt.After(now) {
+		return current
+	}
+	resetCheck := resetAt.Add(quotaResetGrace)
+	if resetCheck.Before(current) {
+		return resetCheck
+	}
+	return current
+}
+
+func nextRateLimitBackoff(previous time.Duration) time.Duration {
+	if previous < rateLimitBackoffMin {
+		return rateLimitBackoffMin
+	}
+	next := previous * 2
+	if next > rateLimitBackoffMax {
+		return rateLimitBackoffMax
+	}
+	return next
 }
 
 func sortObservations(items []observation, fiveHourMode string, maxUtilization float64) {
@@ -210,7 +422,12 @@ func decisionFor(item observation, fiveHourMode string, maxUtilization float64) 
 }
 
 func changeLogAttrs(change Change) []any {
-	return observationLogAttrs(change.Provider, observation{Credential: change.Credential, Quota: change.Quota}, change.Decision, change.OldPriority, change.NewPriority)
+	return observationLogAttrs(change.Provider, observation{
+		Credential: change.Credential,
+		Quota:      change.Quota,
+		Cached:     change.Cached,
+		NextCheck:  change.NextCheck,
+	}, change.Decision, change.OldPriority, change.NewPriority)
 }
 
 func observationLogAttrs(provider string, item observation, decision string, oldPriority, newPriority int) []any {
@@ -218,6 +435,8 @@ func observationLogAttrs(provider string, item observation, decision string, old
 		"provider", provider,
 		"credential", item.Credential.TargetName(),
 		"decision", decision,
+		"quota_cached", item.Cached,
+		"quota_next_check_at", item.NextCheck.Format(time.RFC3339),
 		"weekly_reset_at", item.Quota.Weekly.ResetAt.Format(time.RFC3339),
 		"weekly_utilization", item.Quota.Weekly.Utilization,
 		"weekly_source", item.Quota.Weekly.Source,

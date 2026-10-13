@@ -20,6 +20,7 @@ const (
 	defaultPriorityStep           = 1
 	defaultFiveHourMode           = "off"
 	defaultFiveHourMaxUtilization = 90.0
+	defaultQuotaRequestSpacing    = time.Second
 )
 
 type Config struct {
@@ -33,6 +34,7 @@ type Config struct {
 	PriorityStep           int
 	FiveHourMode           string
 	FiveHourMaxUtilization float64
+	QuotaRequestSpacing    time.Duration
 	DryRun                 bool
 	Once                   bool
 }
@@ -40,7 +42,7 @@ type Config struct {
 func Load(args []string) (Config, error) {
 	cfg := Config{
 		URL:                    envString("CLIPROXY_URL", defaultURL),
-		ManagementKey:          firstNonEmpty(os.Getenv("CLIPROXY_MANAGEMENT_KEY"), os.Getenv("MANAGEMENT_KEY")),
+		ManagementKey:          firstNonEmpty(os.Getenv("CLIPROXY_MANAGEMENT_KEY"), os.Getenv("MANAGEMEENT_KEY")),
 		APIVersion:             strings.ToLower(envString("CLIPROXY_API_VERSION", defaultAPIVersion)),
 		Interval:               envDuration("CLIPROXY_INTERVAL", defaultInterval),
 		HTTPTimeout:            envDuration("CLIPROXY_HTTP_TIMEOUT", defaultHTTPTimeout),
@@ -48,6 +50,7 @@ func Load(args []string) (Config, error) {
 		PriorityStep:           envInt("CLIPROXY_PRIORITY_STEP", defaultPriorityStep),
 		FiveHourMode:           strings.ToLower(envString("CLIPROXY_FIVE_HOUR_MODE", defaultFiveHourMode)),
 		FiveHourMaxUtilization: envFloat("CLIPROXY_FIVE_HOUR_MAX_UTILIZATION", defaultFiveHourMaxUtilization),
+		QuotaRequestSpacing:    envDuration("CLIPROXY_QUOTA_REQUEST_SPACING", defaultQuotaRequestSpacing),
 		DryRun:                 envBool("CLIPROXY_DRY_RUN", false),
 		Once:                   envBool("CLIPROXY_ONCE", false),
 	}
@@ -64,6 +67,7 @@ func Load(args []string) (Config, error) {
 	fs.IntVar(&cfg.PriorityStep, "priority-step", cfg.PriorityStep, "priority decrement per rank tier")
 	fs.StringVar(&cfg.FiveHourMode, "five-hour-mode", cfg.FiveHourMode, "5-hour policy: off or guardrail")
 	fs.Float64Var(&cfg.FiveHourMaxUtilization, "five-hour-max-utilization", cfg.FiveHourMaxUtilization, "guardrail threshold as percent used")
+	fs.DurationVar(&cfg.QuotaRequestSpacing, "quota-request-spacing", cfg.QuotaRequestSpacing, "minimum spacing between provider quota requests")
 	fs.BoolVar(&cfg.DryRun, "dry-run", cfg.DryRun, "show decisions without applying changes")
 	fs.BoolVar(&cfg.Once, "once", cfg.Once, "run one reconciliation and exit")
 	if err := fs.Parse(args); err != nil {
@@ -88,7 +92,7 @@ func Load(args []string) (Config, error) {
 	}
 	for provider := range cfg.Providers {
 		if provider != "claude" && provider != "codex" {
-			return Config{}, fmt.Errorf("unsupported provider %q", provider)
+			return Config{}, fmt.Errorf(unsupported provider %q", provider)
 		}
 	}
 	if cfg.Interval <= 0 {
@@ -107,6 +111,9 @@ func Load(args []string) (Config, error) {
 	}
 	if cfg.FiveHourMaxUtilization <= 0 || cfg.FiveHourMaxUtilization > 100 {
 		return Config{}, errors.New("five-hour-max-utilization must be greater than 0 and at most 100")
+	}
+	if cfg.QuotaRequestSpacing < 0 {
+		return Config{}, errors.New("quota-request-spacing cannot be negative")
 	}
 	return cfg, nil
 }

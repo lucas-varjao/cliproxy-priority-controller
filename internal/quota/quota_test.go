@@ -35,7 +35,7 @@ func TestParseClaudeLimitsFallbackReturnsBothWindows(t *testing.T) {
 	if result.FiveHour == nil {
 		t.Fatal("five-hour fallback window is nil")
 	}
-	if result.FiveHour.Source != "limits:session" {
+	if result.FiveHour .Source != "limits:session" {
 		t.Fatalf("five-hour source = %q", result.FiveHour.Source)
 	}
 	if got, want := result.Weekly.ResetAt.Format(time.RFC3339), "2026-10-15T12:00:00Z"; got != want {
@@ -58,7 +58,7 @@ func TestParseCodexSecondaryWeeklyAndPrimaryFiveHour(t *testing.T) {
 		t.Fatal("five-hour window is nil")
 	}
 	if result.FiveHour.Utilization != 25 {
-		t.Fatalf("five-hour utilization = %v, want 25", result.FiveHour.Utilization)
+		t.Fatalf("five-hour utilization = %v, want 25", result.FiveHour .Utilization)
 	}
 	if result.Weekly.Utilization != 70 {
 		t.Fatalf("weekly utilization = %v, want 70", result.Weekly.Utilization)
@@ -70,16 +70,11 @@ func TestParseCodexSecondaryWeeklyAndPrimaryFiveHour(t *testing.T) {
 
 func TestParseCodexWeeklyCanBePrimary(t *testing.T) {
 	now := time.Date(2026, 10, 12, 20, 0, 0, 0, time.UTC)
-	result, err := parseCodex([]byte(`{
-		"rate_limit": {
-			"primary_window": {"used_percent": 30, "limit_window_seconds": 604800, "reset_after_seconds": 3600}
-		}
-	}`), now)
+	result, err := parseCodex([]byte(`{"rate_limit":{"primary_window":{"used_percent":30,"limit_window_seconds":604800,"reset_after_seconds":3600}}}`), now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := now.Add(time.Hour)
-	if !result.Weekly.ResetAt.Equal(want) {
+	if want := now.Add(time.Hour); !result.Weekly.ResetAt.Equal(want) {
 		t.Fatalf("weekly reset = %s, want %s", result.Weekly.ResetAt, want)
 	}
 	if result.FiveHour != nil {
@@ -89,12 +84,7 @@ func TestParseCodexWeeklyCanBePrimary(t *testing.T) {
 
 func TestParseCodexLegacyPrimaryAndSecondary(t *testing.T) {
 	now := time.Date(2026, 10, 12, 20, 0, 0, 0, time.UTC)
-	result, err := parseCodex([]byte(`{
-		"rate_limit": {
-			"primary_window": {"used_percent": 35, "reset_after_seconds": 3600},
-			"secondary_window": {"used_percent": 65, "reset_after_seconds": 86400}
-		}
-	}`), now)
+	result, err := parseCodex([]byte(`{"rate_limit":{"primary_window":{"used_percent":35,"reset_after_seconds":3600},"secondary_window":{"used_percent":65,"reset_after_seconds":86400}}}`), now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,12 +98,24 @@ func TestParseCodexLegacyPrimaryAndSecondary(t *testing.T) {
 
 func TestParseCodexDoesNotTreatMonthlyAsWeekly(t *testing.T) {
 	now := time.Date(2026, 10, 12, 20, 0, 0, 0, time.UTC)
-	_, err := parseCodex([]byte(`{
-		"rate_limit": {
-			"primary_window": {"used_percent": 30, "limit_window_seconds": 2592000, "reset_after_seconds": 3600}
-		}
-	}`), now)
+	_, err := parseCodex([]byte(`{"rate_limit":{"primary_window":{"used_percent":30,"limit_window_seconds":2592000,"reset_after_seconds":3600}}}`), now)
 	if err == nil {
 		t.Fatal("expected error for monthly-only response")
+	}
+}
+
+func TestParseRetryAfterSeconds(t *testing.T) {
+	now := time.Date(2026, 10, 12, 20, 0, 0, 0, time.UTC)
+	got := parseRetryAfter(map[string][]string{"retry-after": {"120"}}, now)
+	if got != 2*time.Minute {
+		t.Fatalf("retry-after = %s, want 2m", got)
+	}
+}
+
+func TestParseRetryAfterHTTPDate(t *testing.T) {
+	now := time.Date(2026, 10, 12, 20, 0, 0, 0, time.UTC)
+	got := parseRetryAfter(map[string][]string{"Retry-After": {"Sun, 12 Oct 2026 20:10:00 GMT"}}, now)
+	if got != 10*time.Minute {
+		t.Fatalf("retry-after = %s, want 10m", got)
 	}
 }

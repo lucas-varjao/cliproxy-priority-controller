@@ -28,6 +28,7 @@ type UpstreamError struct {
 	Provider   string
 	StatusCode int
 	Body       string
+	RetryAfter time.Duration
 }
 
 func (e *UpstreamError) Error() string {
@@ -39,10 +40,23 @@ func IsUnauthorized(err error) bool {
 	return errors.As(err, &upstream) && upstream.StatusCode == http.StatusUnauthorized
 }
 
+func IsRateLimited(err error) bool {
+	var upstream *UpstreamError
+	return errors.As(err, &upstream) && upstream.StatusCode == http.StatusTooManyRequests
+}
+
+func RateLimitRetryAfter(err error) time.Duration {
+	var upstream *UpstreamError
+	if !errors.As(err, &upstream) || upstream.StatusCode != http.StatusTooManyRequests {
+		return 0
+	}
+	return upstream.RetryAfter
+}
+
 func Fetch(ctx context.Context, client *cliproxy.Client, credential cliproxy.Credential, userAgent string, now time.Time) (Result, error) {
 	switch credential.ProviderName() {
 	case "claude":
-		return fetchClaude(ctx, client, credential, userAgent)
+		return fetchClaude(ctx, client, credential, userAgent, now)
 	case "codex":
 		return fetchCodex(ctx, client, credential, userAgent, now)
 	default:
@@ -50,7 +64,7 @@ func Fetch(ctx context.Context, client *cliproxy.Client, credential cliproxy.Cre
 	}
 }
 
-func fetchClaude(ctx context.Context, client *cliproxy.Client, credential cliproxy.Credential, userAgent string) (Result, error) {
+func fetchClaude(ctx context.Context, client *cliproxy.Client, credential cliproxy.Credential, userAgent string, now time.Time) (Result, error) {
 	response, err := client.APICall(ctx, cliproxy.APICallRequest{
 		AuthIndex: credential.AuthIndex,
 		Method:    http.MethodGet,
@@ -67,7 +81,7 @@ func fetchClaude(ctx context.Context, client *cliproxy.Client, credential clipro
 		return Result{}, err
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return Result{}, &UpstreamError{Provider: "claude", StatusCode: response.StatusCode, Body: response.Body}
+		return Result{}, newUpstreamError("claude", response, now)
 	}
 	return parseClaude([]byte(response.Body))
 }
@@ -182,9 +196,42 @@ func fetchCodex(ctx context.Context, client *cliproxy.Client, credential cliprox
 		return Result{}, err
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return Result{}, &UpstreamError{Provider: "codex", StatusCode: response.StatusCode, Body: response.Body}
+		return Result{}, newUpstreamError("codex", response, now)
 	}
 	return parseCodex([]byte(response.Body), now)
+}
+
+func newUpstreamError(provider string, response cliproxy.APICallResponse, now time.Time) *UpstreamError {
+	return &UpstreamError{
+		Provider:   provider,
+		StatusCode: response.StatusCode,
+		Body:       response.Body,
+		RetryAfter: parseRetryAfter(response.Header, now),
+	}
+}
+
+func parseRetryAfter(headers map[string][]string, now time.Time) time.Duration {
+	var raw string
+	for key, values := range headers {
+		if !strings.EqualFold(key, "Retry-After") || len(values) == 0 {
+			continue
+		}
+		raw = strings.TrimSpace(values[0])
+		break
+	}
+	if raw == "" {
+		return 0
+	}
+	if seconds, err := strconv.Atoi(raw); err == nil && seconds > 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	if deadline, err := http.ParseTime(raw); err == nil {
+		delay := deadline.Sub(now)
+		if delay > 0 {
+			return delay
+		}
+	}
+	return 0
 }
 
 type codexWindow struct {

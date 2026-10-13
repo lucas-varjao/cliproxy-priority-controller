@@ -59,6 +59,23 @@ The resulting order is `B -> C -> A`. Existing sessions already bound to A are n
 
 If every account is constrained, the controller still orders them by weekly reset, so the pool remains usable.
 
+## Provider-friendly polling
+
+`CLIPROXY_INTERVAL` is the local reconciliation tick, **not** the provider quota polling frequency. Quota results are cached per credential.
+
+With the 5-hour guardrail enabled, provider quota reads are scheduled adaptively:
+
+- below `threshold - 20` (default: below 70% used): every 30 minutes;
+- from `threshold - 20` to `threshold - 5` (default: 70–85%): every 15 minutes;
+- from `threshold - 5` to below the threshold (default: 85–90%): every 10 minutes;
+- at or above the threshold: wait until just after the 5-hour reset.
+
+With the guardrail disabled, quota reads use the low-frequency 30-minute interval. In either mode, the controller wakes just after a weekly reset when that occurs sooner than the normal poll.
+
+Actual provider quota calls are spaced by `CLIPROXY_QUOTA_REQUEST_SPACING` (default `1s`) so credentials are not queried in a burst.
+
+On HTTP 429, the controller honors `Retry-After` when it asks for a longer delay. Otherwise it backs off exponentially: 15m -> 30m -> 1h -> 2h (cap). While any credential for a provider is under rate-limit backoff, further quota polling for that provider is paused and the last applied priorities are left unchanged.
+
 ## Dry-run output
 
 `--dry-run` logs the decision for every eligible credential, including accounts whose priority is already correct. This makes it useful for observing both windows before enabling the guardrail.
@@ -69,6 +86,8 @@ Typical fields include:
 provider=claude
 credential=example.json
 decision=weekly-reset
+quota_cached=true
+quota_next_check_at=2026-10-13T02:00:00Z
 weekly_reset_at=2026-10-14T07:59:00Z
 weekly_utilization=80
 five_hour_reset_at=2026-10-13T01:29:00Z
@@ -140,8 +159,9 @@ Environment variables and equivalent command-line flags are supported.
 | `MANAGEMENT_KEY` | empty | Fallback alias for the management key |
 | `CLIPROXY_API_VERSION` | `auto` | `auto`, `v8`, or `v0` |
 | `CLIPROXY_PROVIDERS` | `claude,codex` | Comma-separated providers to manage |
-| `CLIPROXY_INTERVAL` | `5m` | Reconciliation interval |
+| `CLIPROXY_INTERVAL` | `5m` | Local reconciliation tick; provider quota reads are cached |
 | `CLIPROXY_HTTP_TIMEOUT` | `30s` | Per-request HTTP timeout |
+| `CLIPROXY_QUOTA_REQUEST_SPACING` | `1s` | Minimum spacing between actual provider quota requests |
 | `CLIPROXY_PRIORITY_MAX` | `100` | Priority assigned to the highest-ranked credential |
 | `CLIPROXY_PRIORITY_STEP` | `1` | Priority decrement per distinct routing tier |
 | `CLIPROXY_FIVE_HOUR_MODE` | `off` | `off` or `guardrail` |
@@ -158,6 +178,8 @@ The controller deliberately favors consistency over partial reordering:
 - Disabled credentials are ignored.
 - If **any eligible account for a provider fails its quota read**, no priorities for that provider are changed during that cycle.
 - On an upstream quota HTTP 401, the controller asks CLIProxyAPI to refresh that credential and retries once.
+- Provider quota results are cached and refreshed adaptively instead of being queried on every reconciliation tick.
+- On HTTP 429, quota polling backs off (respecting a longer `Retry-After` when present) and leaves existing priorities unchanged.
 - Provider access tokens are never read by this process. The Management API substitutes `$TOKEN$` server-side for the quota request.
 - Tokens and Management API keys are never logged.
 - If a short-window reading is unavailable but the weekly reading is valid, the credential remains eligible and is ranked by weekly reset only.

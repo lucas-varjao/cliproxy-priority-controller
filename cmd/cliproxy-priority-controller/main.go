@@ -40,6 +40,7 @@ func run() error {
 		UserAgent:              userAgent,
 		FiveHourMode:           cfg.FiveHourMode,
 		FiveHourMaxUtilization: cfg.FiveHourMaxUtilization,
+		QuotaRequestSpacing:    cfg.QuotaRequestSpacing,
 	}, logger)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -57,6 +58,7 @@ func run() error {
 		"interval", cfg.Interval,
 		"five_hour_mode", cfg.FiveHourMode,
 		"five_hour_max_utilization", cfg.FiveHourMaxUtilization,
+		"quota_request_spacing", cfg.QuotaRequestSpacing,
 	)
 
 	if err := ctrl.Reconcile(ctx); err != nil {
